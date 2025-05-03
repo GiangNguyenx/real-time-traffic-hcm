@@ -1,0 +1,150 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD-SHELL", "echo srvr | nc localhost 2181 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - app-network
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server kafka:9092 --list || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - app-network
+
+  spark-master:
+    image: bitnami/spark:3.5.5
+    environment:
+      - SPARK_MODE=master
+      - SPARK_DAEMON_MEMORY=1G
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    networks:
+      - app-network
+
+  spark-worker:
+    image: bitnami/spark:3.5.5
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_DAEMON_MEMORY=1G
+    ports:
+      - "8081:8081"
+    networks:
+      - app-network
+
+  spark-streaming:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: spark-streaming-app
+    restart: on-failure
+    depends_on:
+      kafka:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    volumes:
+      - ./spark_streaming_app.py:/app/spark_streaming_app.py
+      - ./gcp-key.json:/gcp/key.json
+      - ./jars/spark-3.5-bigquery-0.42.1.jar:/app/jars/spark-3.5-bigquery-0.42.1.jar
+      - ./checkpoints:/app/checkpoints
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/gcp/key.json
+      - SPARK_CLASSPATH=/app/jars/*:/opt/bitnami/spark/jars/*
+      # Pre-download Kafka connector packages
+      - SPARK_DRIVER_EXTRACLASSPATH=/app/jars/*:/opt/bitnami/spark/jars/*
+      - SPARK_EXECUTOR_EXTRACLASSPATH=/app/jars/*:/opt/bitnami/spark/jars/*
+      - PYSPARK_SUBMIT_ARGS=--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.5,org.apache.kafka:kafka-clients:3.5.1 pyspark-shell
+    ports:
+      - "4040:4040"  # Spark UI
+    networks:
+      - app-network
+      
+  kafka-producer:
+    build:
+      context: ./kafka_producer
+      dockerfile: Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: on-failure
+    networks:
+      - app-network
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    depends_on:
+      - kafka
+      - zookeeper
+    ports:
+      - "8090:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9092
+      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+    networks:
+      - app-network
+
+  # Simple setup tool to initialize the Kafka topics at startup
+  kafka-setup:
+    image: confluentinc/cp-kafka:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      bash -c "
+        echo 'Waiting for Kafka to be ready...' &&
+        sleep 10 &&
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic traffic --partitions 3 --replication-factor 1 &&
+        echo 'Successfully created topics'
+      "
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
